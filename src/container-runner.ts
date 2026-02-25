@@ -35,6 +35,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  mcpServers?: Record<string, { type: 'sse' | 'http'; url: string; headers?: Record<string, string> }>;
 }
 
 export interface ContainerOutput {
@@ -186,6 +187,46 @@ function readSecrets(): Record<string, string> {
   return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
 }
 
+/**
+ * Read URL-based MCP servers from .mcp.json and rewrite localhost URLs
+ * to the Apple Container bridge gateway (192.168.64.1) so the container
+ * can reach host services.
+ */
+function readUrlMcpServers(): Record<string, { type: 'sse' | 'http'; url: string; headers?: Record<string, string> }> {
+  const mcpJsonPath = path.join(process.cwd(), '.mcp.json');
+  if (!fs.existsSync(mcpJsonPath)) return {};
+
+  try {
+    const mcpConfig = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8'));
+    const servers = mcpConfig.mcpServers || {};
+    const result: Record<string, { type: 'sse' | 'http'; url: string; headers?: Record<string, string> }> = {};
+
+    for (const [name, config] of Object.entries(servers)) {
+      const entry = config as Record<string, unknown>;
+      if (typeof entry.url !== 'string') continue;
+
+      let url: string = entry.url;
+      // Rewrite localhost/127.0.0.1 → Apple Container bridge gateway
+      url = url.replace(/\/\/(localhost|127\.0\.0\.1)([:\/])/, '//192.168.64.1$2');
+
+      result[name] = {
+        type: (entry.type as 'sse' | 'http') || 'http',
+        url,
+        ...(entry.headers ? { headers: entry.headers as Record<string, string> } : {}),
+      };
+    }
+
+    if (Object.keys(result).length > 0) {
+      logger.info({ servers: Object.keys(result) }, 'Forwarding URL-based MCP servers to container');
+    }
+
+    return result;
+  } catch (err) {
+    logger.warn({ error: err }, 'Failed to read .mcp.json for URL-based MCP servers');
+    return {};
+  }
+}
+
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -269,8 +310,9 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
+    // Pass secrets and URL-based MCP servers via stdin (never written to disk)
     input.secrets = readSecrets();
+    input.mcpServers = readUrlMcpServers();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
